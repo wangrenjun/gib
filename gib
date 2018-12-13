@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+
+readonly SCRIPT_NAME="$(basename $0)"
+readonly SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+source "${SCRIPT_DIR}/../shcommons/essentials.sh"
+source "${SCRIPT_DIR}/../shcommons/extras.sh"
+source "${SCRIPT_DIR}/../shcommons/log.sh"
+
+readonly GITHUB_MAX_PER_PAGE=100
+readonly GITLAB_MAX_PER_PAGE=100
+
+usage()
+{
+    pusage "$SCRIPT_NAME [-h|--help] <command> [<args>]"
+    echo 'Command:'
+    echo '    clone            Bulk clone repositories'
+    echo '    pull             Bulk pull'
+    echo '    clone-or-pull    Bulk clone or pull if exists'
+    echo 'Running this script require the jq(https://stedolan.github.io/jq/) to be installed in the system.'
+    exit
+}
+
+clone_usage()
+{
+    pusage "$SCRIPT_NAME clone [-c|--conf <configuration file>] [-h|--help]"
+    exit
+}
+
+pull_usage()
+{
+    pusage "$SCRIPT_NAME pull [-c|--conf <configuration file>] [-h|--help]"
+    exit
+}
+
+clone_or_pull_usage()
+{
+    pusage "$SCRIPT_NAME pull [-c|--conf <configuration file>] [-h|--help]"
+    exit
+}
+
+# Get username or organization name
+get_name_from_url()
+{
+    name="$(basename $1)"
+    echo "${name%.*}"
+}
+
+# $1: repo_url, $2: branch, $3: dir
+command_clone()
+{
+    branch="${2:-${default_branch:-}}"
+    peval_noout "git clone --recursive -q${branch:+ -b $branch} ${1} ${3:+$(readlink -nf ${3})}" "${SCRIPT_NAME}:" "${1}:"
+}
+
+# $1: repo_url, $2: branch, $3: dir
+command_pull()
+{
+    dir="${3:+$(readlink -nf ${3})}"
+    dir="${dir:-$(get_name_from_url ${1})}"
+    if ! pushd "$dir" &> /dev/null; then
+        perrorl "${SCRIPT_NAME}:" "${dir}:" 'No such file or directory'
+        return "$ENO_ENOENT"
+    fi
+    branch="${2:-${default_branch:-master}}"
+    peval_noout "git checkout -q $branch" "${SCRIPT_NAME}:" "${1}:"; rv="${?}"
+    [ "$rv" != 0 ] && return "$rv"
+    peval_noout "git pull -q"; rv="${?}"
+    [ "$rv" != 0 ] && return "$rv"
+    popd &> /dev/null
+    return "$rv"
+}
+
+clone_repos_of_user_from_github()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_clone "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_repos_of_user_from_gitlab()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/users/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_clone "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_repos_of_org_from_github()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/orgs/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_clone "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_repos_of_org_from_gitlab()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/groups/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_clone "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+pull_repos_of_user_from_github()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_pull "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+pull_repos_of_user_from_gitlab()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/users/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_pull "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+pull_repos_of_org_from_github()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/orgs/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_pull "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+pull_repos_of_org_from_gitlab()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/groups/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            command_pull "$repo" "$branch" "$dir"
+        done
+        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_or_pull_repos_of_user_from_github()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            if ! command_clone "$repo" "$branch" "$dir"; then
+                command_pull "$repo" "$branch" "$dir"
+            fi
+        done
+        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_or_pull_repos_of_user_from_gitlab()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/users/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            if ! command_clone "$repo" "$branch" "$dir"; then
+                command_pull "$repo" "$branch" "$dir"
+            fi
+        done
+        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_or_pull_repos_of_org_from_github()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/orgs/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            if ! command_clone "$repo" "$branch" "$dir"; then
+                command_pull "$repo" "$branch" "$dir"
+            fi
+        done
+        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone_or_pull_repos_of_org_from_gitlab()
+{
+    pagination=; pageno=2
+    while :; do
+        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/groups/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo')
+        is_empty "$repo_list" && break
+        for repo in $repo_list; do
+            if ! command_clone "$repo" "$branch" "$dir"; then
+                command_pull "$repo" "$branch" "$dir"
+            fi
+        done
+        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
+    done
+}
+
+clone()
+{
+    opts="$(getopt -o c:h --long conf:,help -n $SCRIPT_NAME -- ${@})"
+    if [ "${?}" != 0 ]; then
+        perrorl "${SCRIPT_NAME}:" 'Failed to parsing options'
+        clone_usage
+    fi
+    eval set -- "$opts"
+    config_files=()
+    while true; do
+        case "${1}" in
+        -c | --conf ) config_files+=( "${2}" ); shift 2 ;;
+        -h | --help ) clone_usage ;;
+        -- ) shift; break ;;
+        * ) die "$ENO_ERROR" "${SCRIPT_NAME}:" 'Internal error' ;;
+        esac
+    done
+    [ "${#config_files[@]}" = 0 ] && clone_usage
+    for c in "${config_files[@]}"; do
+        while read line; do
+            for i in ${line[@]}; do
+                [ "${i:0:1}" = '#' ] && break   # Skip comment
+                eval "$i"
+            done
+            if is_set "$base_dir"; then
+                popd &> /dev/null
+                base_dir="${base_dir:+$(readlink -nf $base_dir)}"
+                mkdir -p "${base_dir:-$PWD}" 2> /dev/null && pushd "${base_dir:-$PWD}" &> /dev/null
+                unset base_dir
+            fi
+            if is_set "$repo_url"; then
+                command_clone "$repo_url" "$branch" "$dir"
+            elif is_set "$user_url"; then
+                domain=$(dirname "$user_url")
+                username=$(get_name_from_url "$user_url")
+                if [[ "$domain" =~ github\.com ]]; then
+                    clone_repos_of_user_from_github "$username"
+                elif [[ "$domain" =~ gitlab\.com ]]; then
+                    clone_repos_of_user_from_gitlab "$username"
+                fi
+            elif is_set "$org_url"; then
+                domain=$(dirname "$org_url")
+                orgname=$(get_name_from_url "$org_url")
+                if [[ "$domain" =~ github\.com ]]; then
+                    clone_repos_of_org_from_github "$orgname"
+                elif [[ "$domain" =~ gitlab\.com ]]; then
+                    clone_repos_of_org_from_gitlab "$orgname"
+                fi
+            fi
+            unset repo_url user_url org_url branch dir access_token
+        done < "$c"
+        unset base_dir default_branch
+    done
+}
+
+pull()
+{
+    opts="$(getopt -o c:h --long conf:,help -n $SCRIPT_NAME -- ${@})"
+    if [ "${?}" != 0 ]; then
+        perrorl "${SCRIPT_NAME}:" 'Failed to parsing options'
+        pull_usage
+    fi
+    eval set -- "$opts"
+    config_files=()
+    while true; do
+        case "${1}" in
+        -c | --conf ) config_files+=( "${2}" ); shift 2 ;;
+        -h | --help ) pull_usage ;;
+        -- ) shift; break ;;
+        * ) die "$ENO_ERROR" "${SCRIPT_NAME}:" 'Internal error' ;;
+        esac
+    done
+    [ "${#config_files[@]}" = 0 ] && pull_usage
+    for c in "${config_files[@]}"; do
+        while read line; do
+            [ "${line:0:1}" = '#' ] && continue
+            for i in ${line[@]}; do
+                eval "$i"
+            done
+            if is_set "$base_dir"; then
+                popd &> /dev/null
+                base_dir="${base_dir:+$(readlink -nf $base_dir)}"
+                if ! pushd "${base_dir:-$PWD}" &> /dev/null; then
+                    perrorl "${SCRIPT_NAME}:" "${dir}:" 'No such file or directory'
+                    return "$ENO_ENOENT"
+                fi
+                unset base_dir
+            fi
+            if is_set "$repo_url"; then
+                command_pull "$repo_url" "$branch" "$dir"
+            elif is_set "$user_url"; then
+                domain=$(dirname "$user_url")
+                username=$(get_name_from_url "$user_url")
+                if [[ "$domain" =~ github\.com ]]; then
+                    pull_repos_of_user_from_github "$username"
+                elif [[ "$domain" =~ gitlab\.com ]]; then
+                    pull_repos_of_user_from_gitlab "$username"
+                fi
+            elif is_set "$org_url"; then
+                domain=$(dirname "$org_url")
+                orgname=$(get_name_from_url "$org_url")
+                if [[ "$domain" =~ github\.com ]]; then
+                    pull_repos_of_org_from_github "$orgname"
+                elif [[ "$domain" =~ gitlab\.com ]]; then
+                    pull_repos_of_org_from_gitlab "$orgname"
+                fi
+            fi
+            unset repo_url user_url org_url branch dir access_token
+        done < "$c"
+        unset base_dir default_branch
+    done
+}
+
+clone_or_pull()
+{
+    opts="$(getopt -o c:h --long conf:,help -n $SCRIPT_NAME -- ${@})"
+    if [ "${?}" != 0 ]; then
+        perrorl "${SCRIPT_NAME}:" 'Failed to parsing options'
+        pull_usage
+    fi
+    eval set -- "$opts"
+    config_files=()
+    while true; do
+        case "${1}" in
+        -c | --conf ) config_files+=( "${2}" ); shift 2 ;;
+        -h | --help ) pull_usage ;;
+        -- ) shift; break ;;
+        * ) die "$ENO_ERROR" "${SCRIPT_NAME}:" 'Internal error' ;;
+        esac
+    done
+    [ "${#config_files[@]}" = 0 ] && pull_usage
+    for c in "${config_files[@]}"; do
+        while read line; do
+            [ "${line:0:1}" = '#' ] && continue
+            for i in ${line[@]}; do
+                eval "$i"
+            done
+            if is_set "$base_dir"; then
+                popd &> /dev/null
+                base_dir="${base_dir:+$(readlink -nf $base_dir)}"
+                mkdir -p "${base_dir:-$PWD}" 2> /dev/null && pushd "${base_dir:-$PWD}" &> /dev/null
+                unset base_dir
+            fi
+            if is_set "$repo_url"; then
+                if ! command_clone "$repo_url" "$branch" "$dir"; then
+                    command_pull "$repo_url" "$branch" "$dir"
+                fi
+            elif is_set "$user_url"; then
+                domain=$(dirname "$user_url")
+                username=$(get_name_from_url "$user_url")
+                if [[ "$domain" =~ github\.com ]]; then
+                    clone_or_pull_repos_of_user_from_github "$username"
+                elif [[ "$domain" =~ gitlab\.com ]]; then
+                    clone_or_pull_repos_of_user_from_gitlab "$username"
+                fi
+            elif is_set "$org_url"; then
+                domain=$(dirname "$org_url")
+                orgname=$(get_name_from_url "$org_url")
+                if [[ "$domain" =~ github\.com ]]; then
+                    clone_or_pull_repos_of_org_from_github "$orgname"
+                elif [[ "$domain" =~ gitlab\.com ]]; then
+                    clone_or_pull_repos_of_org_from_gitlab "$orgname"
+                fi
+            fi
+            unset repo_url user_url org_url branch dir access_token
+        done < "$c"
+        unset base_dir default_branch
+    done
+}
+
+main()
+{
+    cmd="${1}"; shift
+    case "$cmd" in
+    -h | --help ) usage ;;
+    clone ) clone "${@}" ;;
+    pull ) pull "${@}" ;;
+    clone-or-pull ) clone_or_pull "${@}" ;;
+    * ) usage ;;
+    esac
+}
+
+main "${@}"

@@ -1,0 +1,10 @@
+base_dir=./myrepos/
+# default_branch=master
+repo_url=git@github.com:wangrenjun/coline.vim.git       dir=vimcoline       #branch=develop
+
+base_dir=./myrepos/users
+# for users
+user_url=https://github.com/wangrenjun                  #access_token=...
+
+# for organizations(github) or groups(gitlab)
+#org_url=https://github.com/google
