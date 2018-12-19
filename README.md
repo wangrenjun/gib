@@ -49,4 +49,4 @@ Configuration supported variables
 * branch: Git branch of the repositories in this line
 * access_token: `Personal Access Token` in this line
 
-![image](https://github.com/wangrenjun/gib/raw/master/screenshots/example.png)
+![image](https://github.com/wangrenjun/gib/raw/master/screenshots/demo.png)
