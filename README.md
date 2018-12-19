@@ -34,19 +34,22 @@ USAGE: gib clone-or-pull [-c|--conf <configuration file>] [-v|--verbose] [-h|--h
 Configuration supported variables
 ---------------------------------
 
-* base_dir: **Global default working directory**
-* default_branch: **Global default repository branch**
-* default_access_token: **Global default `Personal Access Token`, use them when executing clone/pull commands**
-* repo_url: Repository git url (http/ssh)
-* github_user: Username in github
-* github_org: Organization name in github
-* github_starred: Username in github, it will clone/pull all his starred repositories
-* github_watched: Username in github, it will clone/pull all his watched repositories
-* github_all_following: Username in github, it will clone/pull all the repositories of people he following
-* gitlab_user: Username in gitlab
-* gitlab_group: Group name in github
-* dir: Directory of the repositories in this line
-* branch: Git branch of the repositories in this line
-* access_token: `Personal Access Token` in this line
+* **base_dir**: Global default working directory
+* **default_branch**: Global default repository branch
+* **default_access_token**: Global default `Personal Access Token`, use them when executing clone/pull commands
+* **repo_url**: Repository git url (http/ssh)
+* **github_user**: Username in github, it can be the name of organization if you are not sure
+* **github_org**: Organization name in github
+* **github_starred**: Username in github, it will clone/pull all his starred repositories
+* **github_watched**: Username in github, it will clone/pull all his watched repositories
+* **github_all_following**: Username in github, it will clone/pull all the repositories of people he following
+* **gitlab_user**: Username in gitlab
+* **gitlab_group**: Group name in github
+* **dir**: Directory of the repositories in this line
+* **branch**: Git branch of the repositories in this line
+* **access_token**: `Personal Access Token` in this line
+
+Demo
+----
 
 ![image](https://github.com/wangrenjun/gib/raw/master/screenshots/demo.png)
