@@ -1,4 +1,4 @@
-Run git in bulk
+This shell script run Git in bulk for simplifies fetch a lot of repositories, it support query Github / Gitlab / Bitbucket APIs to get the job done
 
 Currently supported features
 ------------------------------
