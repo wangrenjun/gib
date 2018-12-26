@@ -42,7 +42,7 @@ clone_or_pull_usage()
 # Get username or organization name
 get_name_from_url()
 {
-    name="$(basename $1)"
+    name="$(basename ${1})"
     echo "${name%.*}"
 }
 
@@ -114,6 +114,7 @@ get_user_repos_from_github()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
         is_empty "$repo_list" && break
         for repo in $repo_list; do
@@ -129,6 +130,7 @@ get_repos_of_user_from_gitlab()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/users/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo' 2> /dev/null)
         is_empty "$repo_list" && break
         for repo in $repo_list; do
@@ -144,6 +146,7 @@ get_repos_of_org_from_github()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/orgs/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
         is_empty "$repo_list" && break
         for repo in $repo_list; do
@@ -159,6 +162,7 @@ get_repos_of_org_from_gitlab()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/groups/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo' 2> /dev/null)
         is_empty "$repo_list" && break
         for repo in $repo_list; do
@@ -174,6 +178,7 @@ get_repos_of_starred_from_github()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/starred${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
         is_empty "$repo_list" && break
         for repo in $repo_list; do
@@ -189,6 +194,7 @@ get_repos_of_watched_from_github()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/subscriptions${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
         is_empty "$repo_list" && break
         for repo in $repo_list; do
@@ -204,6 +210,7 @@ get_repos_from_following_peoples_in_github()
     mkpd "${dir:-$1}" || continue
     pagination=; pageno=2
     while :; do
+        access_token="${access_token:-$default_access_token}"
         people_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/following${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .login' 2> /dev/null)
         is_empty "$people_list" && break
         for people in $people_list; do
@@ -273,9 +280,7 @@ skeleton()
         unset base_dir default_branch default_access_token
         popd &> /dev/null
     done
-    if [ "$is_verbose" = true ]; then
-        kill -9 "$spin_pid" &> /dev/null
-    fi
+    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
 }
 
 clone()

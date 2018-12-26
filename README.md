@@ -1,4 +1,4 @@
-This shell script run Git in bulk for simplifies fetch a lot of repositories, it support query Github / Gitlab / Bitbucket APIs to get the job done
+This shell script run Git in bulk for simplifies fetch a lot of repositories, it can get the repository addresses through the Github / Gitlab / Bitbucket APIs and clone/pull them.
 
 Currently supported features
 ------------------------------
@@ -31,7 +31,7 @@ USAGE: gib pull [-c|--conf <configuration file>] [-v|--verbose] [-h|--help]
 USAGE: gib clone-or-pull [-c|--conf <configuration file>] [-v|--verbose] [-h|--help]
 ```
 
-Configuration supported variables
+Configuration variables
 ---------------------------------
 
 * **base_dir**: Global default working directory
