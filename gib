@@ -9,6 +9,7 @@ source "${SCRIPT_DIR}/../shcommons/log.sh"
 
 readonly GITHUB_MAX_PER_PAGE=100
 readonly GITLAB_MAX_PER_PAGE=100
+readonly SPIN_INTERVAL=0.3
 
 usage()
 {
@@ -63,27 +64,29 @@ mkpd()
 pverbose()
 {
     COLUMNS=$(tput cols) 
-    printf "%s %*s\n" "${1}" $(($COLUMNS-${#1}-1)) "$PWD" >&1
+    printf "%s %*s\n" "${1}" "$(($COLUMNS-${#1}-1))" "${2:-PWD}" >&1
 }
 
 git_clone()
 {
-    [ "$is_verbose" = true ] && pverbose "${1}"
+    d="${3:-$(get_name_from_url ${1})}"
+    d="${d:+$(readlink -nf ${d})}"
+    [ "$is_verbose" = true ] && pverbose "${1}" "$d"
     branch="${2:-${default_branch:-}}"
     peval_noout "git clone --recursive -q${branch:+ -b $branch} ${1} ${3:+$(readlink -nf ${3})}" "${SCRIPT_NAME}:" "${1}:"
 }
 
 git_pull()
 {
-    [ "$is_verbose" = true ] && pverbose "${1}"
-    d="${3:+$(readlink -nf ${3})}"
-    d="${d:-$(get_name_from_url ${1})}"
+    d="${3:-$(get_name_from_url ${1})}"
+    d="${d:+$(readlink -nf ${d})}"
+    [ "$is_verbose" = true ] && pverbose "${1}" "$d"
     ppushd "$d" &> /dev/null || return "$ENO_ENOENT"
     b="${2:-${default_branch:-master}}"
     peval_noout "git checkout -q $b" "${SCRIPT_NAME}:" "${1}:"; rv="${?}"
-    [ "$rv" != 0 ] && return "$rv"
-    peval_noout "git pull -q" "${SCRIPT_NAME}:"; rv="${?}"
-    [ "$rv" != 0 ] && return "$rv"
+    [ "$rv" != 0 ] && popd &> /dev/null && return "$rv"
+    peval_noout "git pull -q" "${SCRIPT_NAME}:" "${1}:"; rv="${?}"
+    [ "$rv" != 0 ] && popd &> /dev/null && return "$rv"
     popd &> /dev/null
     return "$rv"
 }
@@ -227,7 +230,7 @@ skeleton()
     opts="$(getopt -o c:vh --long conf:,verbose,help -n $SCRIPT_NAME -- ${@})"
     if [ "${?}" != 0 ]; then
         perrorl "${SCRIPT_NAME}:" 'Failed to parsing options'
-        "$usagefn"
+        "$usage_fn"
     fi
     eval set -- "$opts"
     config_files=()
@@ -235,14 +238,14 @@ skeleton()
         case "${1}" in
         -c | --conf ) config_files+=( "${2}" ); shift 2 ;;
         -v | --verbose ) is_verbose=true; shift ;;
-        -h | --help ) "$usagefn" ;;
+        -h | --help ) "$usage_fn" ;;
         -- ) shift; break ;;
         * ) die "$ENO_ERROR" "${SCRIPT_NAME}:" 'Internal error' ;;
         esac
     done
-    [ "${#config_files[@]}" = 0 ] && "$usagefn"
+    [ "${#config_files[@]}" = 0 ] && "$when_nonconfig_fn" && exit
     if [ "$is_verbose" = true ]; then
-        spin 0.5 &
+        spin "$SPIN_INTERVAL" &
         spin_pid="$!"
     fi
     for c in "${config_files[@]}"; do
@@ -259,21 +262,21 @@ skeleton()
             fi
             dir="${dir:+$(readlink -nf $dir)}"
             if is_set "$repo_url"; then
-                "$gitfn" "$repo_url" "$branch" "$dir"
+                "$git_fn" "$repo_url" "$branch" "$dir"
             elif is_set "$github_user"; then
-                get_repos_of_user_from_github "$github_user" "$gitfn"
+                get_repos_of_user_from_github "$github_user" "$git_fn"
             elif is_set "$gitlab_user"; then
-                get_repos_of_user_from_gitlab "$gitlab_user" "$gitfn"
+                get_repos_of_user_from_gitlab "$gitlab_user" "$git_fn"
             elif is_set "$github_org"; then
-                get_repos_of_org_from_github "$github_org" "$gitfn"
+                get_repos_of_org_from_github "$github_org" "$git_fn"
             elif is_set "$gitlab_group"; then
-                get_repos_of_org_from_gitlab "$gitlab_group" "$gitfn"
+                get_repos_of_org_from_gitlab "$gitlab_group" "$git_fn"
             elif is_set "$github_starred"; then
-                get_repos_of_starred_from_github "$github_starred" "$gitfn"
+                get_repos_of_starred_from_github "$github_starred" "$git_fn"
             elif is_set "$github_watched"; then
-                get_repos_of_watched_from_github "$github_watched" "$gitfn"
+                get_repos_of_watched_from_github "$github_watched" "$git_fn"
             elif is_set "$github_all_following"; then
-                get_repos_from_following_peoples_in_github "$github_all_following" "$gitfn"
+                get_repos_from_following_peoples_in_github "$github_all_following" "$git_fn"
             fi
             unset repo_url github_user gitlab_user github_org gitlab_group github_starred github_watched github_all_following dir branch access_token
         done < "$c"
@@ -283,24 +286,55 @@ skeleton()
     is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
 }
 
+pull_over_subdirs()
+{
+    repo_base_dirs=()
+    while [ "${#}" -gt 0 ]; do
+        repo_base_dirs+=( "${1}" )
+        shift
+    done
+    [ "${#repo_base_dirs[@]}" = 0 ] && repo_base_dirs+=( "$PWD" )
+    if [ "$is_verbose" = true ]; then
+        spin "$SPIN_INTERVAL" &
+        spin_pid="$!"
+    fi
+    for rbd in "${repo_base_dirs[@]}"; do
+        rbd="$(readlink -nf $rbd)" || continue
+        for rd in "$rbd"/*/; do
+            [ "$is_verbose" = true ] && echo "$rd"
+            ppushd "$rd" &> /dev/null || continue
+            if git rev-parse --is-inside-work-tree &> /dev/null; then
+                if peval_noout "git checkout -q ${branch:-${default_branch:-master}}" "${SCRIPT_NAME}:" "$rd:"; then
+                    peval_noout "git pull -q" "${SCRIPT_NAME}:" "$rd:"
+                fi
+            fi
+            popd &> /dev/null
+        done
+    done
+    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
+}
+
 clone()
 {
-    usagefn='clone_usage'
-    gitfn='git_clone'
+    usage_fn='clone_usage'
+    git_fn='git_clone'
+    when_nonconfig_fn='clone_usage'
     skeleton "${@}"
 }
 
 pull()
 {
-    usagefn='pull_usage'
-    gitfn='git_pull'
+    usage_fn='pull_usage'
+    git_fn='git_pull'
+    when_nonconfig_fn='pull_over_subdirs'
     skeleton "${@}"
 }
 
 clone_or_pull()
 {
-    usagefn='clone_or_pull_usage'
-    gitfn='git_clone_or_pull'
+    usage_fn='clone_or_pull_usage'
+    git_fn='git_clone_or_pull'
+    when_nonconfig_fn='pull_over_subdirs'
     skeleton "${@}"
 }
 
