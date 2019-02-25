@@ -2,354 +2,1091 @@
 
 readonly SCRIPT_NAME="$(basename $0)"
 readonly SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-
-source "${SCRIPT_DIR}/../shcommons/essentials.sh"
-source "${SCRIPT_DIR}/../shcommons/extras.sh"
-source "${SCRIPT_DIR}/../shcommons/log.sh"
-
 readonly GITHUB_MAX_PER_PAGE=100
 readonly GITLAB_MAX_PER_PAGE=100
-readonly SPIN_INTERVAL=0.3
+readonly DEFAULT_SPIN_INTERVAL=0.3
+readonly LOCAL_CONFIG_FILE_PATH='./.gibconf'
+readonly GLOBAL_CONFIG_FILE_PATH='~/.gibconf'
+readonly SYSTEM_CONFIG_FILE_PATH='/etc/gibconf'
+readonly WORKSPACE_NAME_WIDTH=-20
+readonly CONFIG_LINE_WIDTH=-80
+readonly DIR_WIDTH=-25
+readonly DEFAULT_CURL_TIMEOUT_OPTIONS='--connect-timeout 5 --max-time 60'
+readonly DEFAULT_CURL_RETRY_OPTIONS='--retry 5 --retry-delay 0 --retry-max-time 60'
+readonly DEFAULT_GIT_RETRY_NUM=5
+readonly DEFAULT_GIT_RETRY_MAXIMUM_DELAY=30
+
+is_empty()
+{
+    [ -z "${1}" ]
+}
+
+is_set()
+{
+    [ -n "${1}" ]
+}
+
+is_tty()
+{
+    [ -t "${1}" ]
+}
+
+is_dir()
+{
+    [ -d "${1}" ]
+}
+
+is_readable_file()
+{
+    [ -f "${1}" ] && [ -r "${1}" ]
+}
+
+is_number()
+{
+    [[ "${1}" =~ ^-?[0-9]+$ ]]
+}
+
+has_command()
+{
+    command -v "${1}" &> /dev/null
+}
+
+# Join elements with delimiter
+join_by()
+{
+    local d="${1}"; shift; echo -n "$1"; shift; printf "%s" "${@/#/$d}";
+}
+
+# Display the rotating cursor
+spin()
+{
+    local spinner="/-\|"
+    while :; do
+        for (( i = 0; i < ${#spinner}; i++ )); do
+            printf '%s\r' "${spinner:$i:1}"
+            sleep "${1:-1}"
+        done
+    done
+}
+
+readonly CO_NORMAL=$(echo -en "\e[0m")  # Reset
+readonly CO_RED=$(echo -en "\e[31m")
+readonly CO_GREEN=$(echo -en "\e[32m")
+readonly CO_BO_RED=$(echo -en "\e[1;31m")
+readonly CO_BO_GREEN=$(echo -en "\e[1;32m")
+
+__log_headers=()
+__log_field_delimiter=': '
+
+log_push_header()
+{
+    while [ "${#}" \> 0 ]; do
+        __log_headers["${#__log_headers[@]}"]="${1}"
+        shift
+    done
+}
+
+log_pop_header()
+{
+    if [ "${#__log_headers[@]}" \> 0 ]; then
+        unset __log_headers["${#__log_headers[@]}"-1]
+    fi
+}
+
+__log_buffer=()
+
+log_flush()
+{
+    for l in "${__log_buffer[@]}"; do
+        echo -e "$l"
+    done
+    unset __log_buffer
+}
+
+log_error()
+{
+    is_set "$__log_off" && return
+    local line=$(join_by "${__log_field_delimiter}" ${__log_levels:+error} "${__log_headers[@]}" "${@}")
+    line="${__log_color_stderr:+${CO_RED}}${line}${__log_color_stderr:+${CO_NORMAL}}"
+    if is_set "$__log_buffered_mode"; then
+        __log_buffer+=( "$line" )
+    else
+        echo -e "$line" >&2
+    fi
+}
+
+log_info()
+{
+    is_set "$__log_off" && return
+    local line=$(join_by "${__log_field_delimiter}" ${__log_levels:+info} "${__log_headers[@]}" "${@}")
+    if is_set "$__log_buffered_mode"; then
+        __log_buffer+=( "$line" )
+    else
+        echo -e "${line}" >&2
+    fi
+}
+
+log_checkup_message()
+{
+    is_set "$__log_off" && return
+    local line=$(join_by "${__log_field_delimiter}" ${__log_levels:+info} "${__log_headers[@]}" "${@}")
+    line="${__log_color_stderr:+${CO_BO_RED}}${line}${__log_color_stderr:+${CO_NORMAL}}"
+    if is_set "$__log_buffered_mode"; then
+        __log_buffer+=( "$line" )
+    else
+        echo -e "${line}" >&2
+    fi
+}
+
+log_sub_command_message()
+{
+    is_set "$__log_off" && return
+    if [ "${1}" = 0 ]; then
+        local co="$CO_BO_GREEN"
+    else
+        local co="$CO_BO_RED"
+    fi
+    shift
+    local line=$(join_by "${__log_field_delimiter}" ${__log_levels:+info} "${__log_headers[@]}" "${@}")
+    line="${__log_color_stderr:+${co}}${line}${__log_color_stderr:+${CO_NORMAL}}"
+    if is_set "$__log_buffered_mode"; then
+        __log_buffer+=( "$line" )
+    else
+        echo -e "${line}" >&2
+    fi
+}
+
+declare -r EC_ERROR=1               # General error
+declare -r EC_ENOENT=97             # No such file or directory
+declare -r EC_ILLEGAL_CMD=127       # Command not found
+declare -r EC_FATAL_SIGNAL_BASE=128 # Base value for fatal error signal "n"
+
+# Default trap handler
+on_trapped()
+{
+    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
+    local num name
+    if is_number "${1}"; then
+        num="${1}"
+        name=$(kill -l "${1}")
+    else
+        name="${1}"
+        num=$(kill -l "${1}")
+    fi
+    log_info "Interrupted by signal $name"
+    exit "$((EC_FATAL_SIGNAL_BASE + num))"
+}
+
+set_trap_handler()
+{
+    local func="${1}" sig; shift
+    for sig ; do
+        trap "$func $sig" "$sig"
+    done
+}
 
 usage()
 {
-    pusage "$SCRIPT_NAME [-h|--help] COMMAND [<args>]"
-    echo 'List of commands:'
-    echo '    clone            Bulk clone repositories'
-    echo '    pull             Bulk pull'
-    echo '    clone-or-pull    Bulk clone or pull if exists'
-    echo 'Running this script require the jq(https://stedolan.github.io/jq/) to be installed in the system.'
+    cat << EOF >&2
+USAGE: $SCRIPT_NAME [-h | --help] [-v | --verbose] [-q | --quiet] [--force]
+           [--local] [--global] [--system] [-f <config file> | --file <config file>]
+           [-l | --list] [-w <workspace name> | --workspace <workspace name>]
+           [--repourls[=<url>]] [--repodirs[=<path>]] [--users[=<user>]]
+           [--orgs[=<organization>]] [--starrings[=<user>]] [--watchings[=<user>]] [--followings[=<user>]]
+           [--clone] [--checkup]
+           COMMAND
+
+OPTIONS
+        -v, --verbose
+            Verbose output. Progress will be reported to stdout.
+
+        -q, --quiet
+            Operate quietly. Error message and progress is not reported to stdout and stderr.
+
+        --force
+            Enable forced mode to execute commands. Perform forced clone when it appears with the --clone option.
+
+        --local
+            Load the configuration file in the current directory ./.gibconf.
+
+        --global
+            Load user-wide configuration file ~/.gibconf.
+
+        --system
+            Load system-wide configuration file /etc/gibconf.
+
+        -f <config file>, --file <config file>
+            Use the given config file.
+
+        -l, --list
+            Output the configuration file. The format command is git config.
+
+        -w <workspace name>, --workspace <workspace name>
+            Specify the workspace name to operate. Each workspace contains the repositories, directories, users, Only one workspace can be specified per run.
+
+        --repourls[=<url>]
+            Specify the section of the repository urls.
+
+        --repodirs[=<path>]
+            Specify the section of the repository directories.
+
+        --users[=<user>]
+            Specify the section of the users.
+
+        --orgs[=<organization>]
+            Specify the section of the organizations.
+
+        --starrings[=<user>]
+            Specify the section of the starred by user.
+
+        --watchings[=<user>]
+            Specify the section of the watching by user.
+
+        --followings[=<user>]
+            Specify the section of the following by user.
+
+        --clone
+            Batch cloning or forced clone if the repository exists and --force option is used.
+
+        --checkup
+            Batch check the repositories, including their default branch and working tree status.
+
+EOF
     exit
 }
 
-clone_usage()
+verbose_left_align()
 {
-    pusage "$SCRIPT_NAME clone [-c|--conf <configuration file>] [-v|--verbose] [-h|--help]"
-    exit
+    if [ "$output_mode" = verbose ]; then
+        if is_set "${2}"; then
+            str=$(printf "%*s%*s%*s%s" "$WORKSPACE_NAME_WIDTH" "$workspace_name.$key" "$CONFIG_LINE_WIDTH" "| '$conf_line'" "$DIR_WIDTH" "| ${1}" "| ${2}")
+        else
+            str=$(printf "%*s%*s%s" "$WORKSPACE_NAME_WIDTH" "$workspace_name.$key" "$CONFIG_LINE_WIDTH" "| '$conf_line'" "| ${1}")
+        fi
+        echo -n "$str"
+        __length_of_left_aligned="${#str}"
+    fi
 }
 
-pull_usage()
+verbose_right_most_align()
 {
-    pusage "$SCRIPT_NAME pull [-c|--conf <configuration file>] [-v|--verbose] [-h|--help]"
-    exit
+    if [ "$output_mode" = verbose ]; then
+        if [ "${1}" = 0 ]; then
+            local co="$CO_BO_GREEN"
+            local msg="${2:-SUCCESS}"
+        else
+            local co="$CO_BO_RED"
+            local msg="${3:-FAILED}"
+        fi
+        if is_set "$__log_color_stdout"; then
+            rightmost_width="$(($(tput cols)-${__length_of_left_aligned}))"
+        else
+            rightmost_width="$((209-${__length_of_left_aligned}))"
+        fi
+        printf "${__log_color_stdout:+${co}}%*s${__log_color_stdout:+${CO_NORMAL}}\n" "$rightmost_width" "$msg"
+    fi
 }
 
-clone_or_pull_usage()
+verbose()
 {
-    pusage "$SCRIPT_NAME clone-or-pull [-c|--conf <configuration file>] [-v|--verbose] [-h|--help]"
-    exit
+    if [ "$output_mode" = verbose ]; then
+        echo -e "${*}"
+    fi
 }
 
 # Get username or organization name
 get_name_from_url()
 {
-    name="$(basename ${1})"
-    echo "${name%.*}"
+    local name=$(basename "${1}" 2> /dev/null)
+    echo -n "${name%.*}"
 }
 
-ppushd()
+check_deps()
 {
-    pushd "${1}" &> /dev/null; rv="${?}"
-    if [ "$rv" != 0 ]; then
-        perrorl "${SCRIPT_NAME}:" "pushd ${1}:" "[$rv]:" "Failed to pushd"
-        return "$rv"
+    if ! has_command git; then
+        log_error 'Running this script require the Git<https://git-scm.com/> to be installed'
+        exit "$EC_ILLEGAL_CMD"
     fi
+    if ! has_command jq; then
+        log_error 'Running this script require the jq<https://stedolan.github.io/jq/> to be installed'
+        exit "$EC_ILLEGAL_CMD"
+    fi
+    if ! has_command curl; then
+        log_error 'Running this script require the curl<https://curl.haxx.se/> to be installed'
+        exit "$EC_ILLEGAL_CMD"
+    fi
+    if ! has_command realpath; then
+        log_error 'Running this script require the Coreutils<http://www.gnu.org/software/coreutils/> to be installed'
+        exit "$EC_ILLEGAL_CMD"
+    fi
+}
+
+# Check if current directory is git repository
+is_inside_git_repo()
+{
+    git rev-parse --is-inside-work-tree &> /dev/null
+}
+
+remote_git_url()
+{
+    git config --local --get remote.origin.url 2> /dev/null
+}
+
+find_git_url_from_repodir()
+{
+    if ! _pushd "${1}"; then
+        return 1
+    fi
+    if ! is_inside_git_repo; then
+        return 1
+    fi
+    echo $(remote_git_url)
+    _popd
+}
+
+readonly GITHUB_API_LIST_USER='https://api.github.com/users/<NAME>'
+readonly GITHUB_API_LIST_USER_REPOS='https://api.github.com/users/<NAME>/repos'
+readonly GITLAB_API_LIST_USER_PROJECTS='https://gitlab.com/api/v4/users/<NAME>/projects'
+readonly GITHUB_API_LIST_ORG_REPOS='https://api.github.com/orgs/<NAME>/repos'
+readonly GITLAB_API_LIST_GROUP_PROJECTS='https://gitlab.com/api/v4/groups/<NAME>/projects'
+readonly GITHUB_API_LIST_USER_STARRED='https://api.github.com/users/<NAME>/starred'
+readonly GITHUB_API_LIST_USER_SUBSCRIPTIONS='https://api.github.com/users/<NAME>/subscriptions'
+readonly GITHUB_API_LIST_USER_FOLLOWING='https://api.github.com/users/<NAME>/following'
+
+query_repos_of_user_in_github()
+{
+    token="${token:-$default_access_token}"
+    token="${token:+ --header \"Authorization: token $token\"}"
+    pageno=1
+    repos=''
+    while :; do
+        list=$(eval "curl -q ${DEFAULT_CURL_TIMEOUT_OPTIONS} ${DEFAULT_CURL_RETRY_OPTIONS} -s${token} '${1}?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}'" 2> /dev/null | jq -r '.[] .ssh_url' 2> /dev/null)
+        is_empty "$list" && break
+        repos+=" $list"
+        let pageno++
+    done
+    echo "$repos"
+}
+
+query_repos_of_user_in_gitlab()
+{
+    token="${token:-$default_access_token}"
+    token="${token:+ --header \"PRIVATE-TOKEN: $token\"}"
+    pageno=1
+    repos=''
+    while :; do
+        list=$(eval "curl -q ${DEFAULT_CURL_TIMEOUT_OPTIONS} ${DEFAULT_CURL_RETRY_OPTIONS} -s${token} '${1}?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}'" 2> /dev/null | jq -r '.[] .ssh_url_to_repo' 2> /dev/null)
+        is_empty "$list" && break
+        repos+=" $list"
+        let pageno++
+    done
+    echo "$repos"
+}
+
+query_following_peoples_in_github()
+{
+    token="${token:-$default_access_token}"
+    token="${token:+ --header \"Authorization: token $token\"}"
+    pageno=1
+    peoples=''
+    while :; do
+        list=$(eval "curl -q ${DEFAULT_CURL_TIMEOUT_OPTIONS} ${DEFAULT_CURL_RETRY_OPTIONS} -s${token} '${1}?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}'" 2> /dev/null | jq -r '.[] .login' 2> /dev/null)
+        is_empty "$list" && break
+        peoples+=" $list"
+        let pageno++
+    done
+    echo "$peoples"
 }
 
 mkpd()
 {
-    peval_noout "mkdir -p ${1}" "${SCRIPT_NAME}:" && ppushd "${1}"
-}
-
-pverbose()
-{
-    COLUMNS=$(tput cols) 
-    printf "%s %*s\n" "${1}" "$(($COLUMNS-${#1}-1))" "${2:-PWD}" >&1
-}
-
-git_clone()
-{
-    d="${3:-$(get_name_from_url ${1})}"
-    d="${d:+$(readlink -nf ${d})}"
-    [ "$is_verbose" = true ] && pverbose "${1}" "$d"
-    branch="${2:-${default_branch:-}}"
-    peval_noout "git clone --recursive -q${branch:+ -b $branch} ${1} ${3:+$(readlink -nf ${3})}" "${SCRIPT_NAME}:" "${1}:"
-}
-
-git_pull()
-{
-    d="${3:-$(get_name_from_url ${1})}"
-    d="${d:+$(readlink -nf ${d})}"
-    [ "$is_verbose" = true ] && pverbose "${1}" "$d"
-    ppushd "$d" &> /dev/null || return "$ENO_ENOENT"
-    b="${2:-${default_branch:-master}}"
-    peval_noout "git checkout -q $b" "${SCRIPT_NAME}:" "${1}:"; rv="${?}"
-    [ "$rv" != 0 ] && popd &> /dev/null && return "$rv"
-    peval_noout "git pull -q" "${SCRIPT_NAME}:" "${1}:"; rv="${?}"
-    [ "$rv" != 0 ] && popd &> /dev/null && return "$rv"
-    popd &> /dev/null
+    mkdir -p "${1}" &> /dev/null && pushd "${1}" &> /dev/null; rv="${?}"
+    [ "$rv" = 0 ] && ws_relpath=$(realpath --relative-to="${workspace_base_dir}" "${PWD}" 2> /dev/null)
     return "$rv"
 }
 
-git_clone_or_pull()
+_pushd()
 {
-    git_clone "${1}" "${2}" "${3}"; rv="${?}"
+    pushd "${1}" &> /dev/null; rv="${?}"
+    [ "$rv" = 0 ] && ws_relpath=$(realpath --relative-to="${workspace_base_dir}" "${PWD}" 2> /dev/null)
+    return "$rv"
+}
+
+_popd()
+{
+    popd &> /dev/null; rv="${?}"
+    [ "$rv" = 0 ] && ws_relpath=$(realpath --relative-to="${workspace_base_dir}" "${PWD}" 2> /dev/null)
+    return "$rv"
+}
+
+load_config()
+{
+    eval "$conf_line" &> /dev/null
+}
+
+clean_config()
+{
+    unset url dir branch token user org api
+}
+
+load_settings()
+{
+    if is_empty "$workspace_name"; then
+        if ! workspace_name=$(git config -f "$config_file_loc" --get gib.default-workspace-name 2> /dev/null); then
+            log_error "'gib.default-workspace-name' not found"
+            exit "$EC_ERROR"
+        fi
+    fi
+    if ! workspace_base_dir=$(git config -f "$config_file_loc" --get "$workspace_name".workspace-base-dir 2> /dev/null); then
+        log_error "'$workspace_name.workspace-base-dir' not found"
+        exit "$EC_ERROR"
+    fi
+    default_access_token=$(git config -f $config_file_loc --get $workspace_name.default-access-token 2> /dev/null)
+}
+
+verbose_settings()
+{
+    if [ "$output_mode" = verbose ]; then
+        echo "Action: $action"
+        echo "  Configuration file: $config_file_loc"
+        echo "  Output mode: $output_mode"
+        echo "  Name of the workspace: $workspace_name"
+        echo "  Base directory of the workspace: $workspace_base_dir"
+        is_set "$default_access_token" && echo "  Default access token: $default_access_token"
+        echo
+    fi
+}
+
+# 1: Command
+# 2: Number of retries
+# 3: Retry maximum interval in seconds
+git_command_autoretry()
+{
+    local retry_num="${2:-${DEFAULT_GIT_RETRY_NUM}}"
+    local retry_maximum_delay="${3:-${DEFAULT_GIT_RETRY_MAXIMUM_DELAY}}"
+    local backoff=1
+    local times=1
+    while :; do
+        eval "git ${1}" &> /dev/null; rv="${?}"
+        if [ "$rv" = 0 ] || [ "$times" -ge "${retry_num}" ]; then
+            break
+        fi
+        sleep "$backoff"
+        [ "$((backoff*2))" -le "$retry_maximum_delay" ] && backoff="$((backoff*2))"
+        let times++
+    done
+    return "$rv"
+}
+
+# 1: repo dir
+# 2: repo url
+force_clone()
+{
+    if ! _pushd "${1}"; then
+        log_error "$ws_relpath" "Failed to change directory '${1}'"
+        return 1
+    fi
+    if ! is_inside_git_repo; then
+        log_error "$ws_relpath" "Directory '${1}' is not a git repository"
+        return 1
+    fi
+    for remote in $(git remote 2> /dev/null); do
+        git remote rm "$remote" &> /dev/null
+    done
+    git remote add origin "${2}" &> /dev/null; rv="${?}"
+    if [ "$rv" = 0 ]; then
+        git fetch origin &> /dev/null; rv="${?}"
+    fi
     if [ "$rv" != 0 ]; then
-        orig_verbose="$is_verbose" && is_verbose=false
-        git_pull "${1}" "${2}" "${3}"; rv="${?}"
-        is_verbose="$orig_verbose"
+        log_error "$ws_relpath" "Failed to changing the repository url to '${2}'"
+        return 1
     fi
-    return "$rv"
-}
-
-get_repos_of_user_from_github()
-{
-    user_type=$(peval "curl -q -s 'https://api.github.com/users/${1}'" "${SCRIPT_NAME}:" | jq -r '.type' 2> /dev/null)
-    case "$user_type" in
-    User ) get_user_repos_from_github "${@}" ;;
-    Organization ) get_repos_of_org_from_github "${@}" ;;
-    * ) perrorl "${SCRIPT_NAME}:" "https://api.github.com/users/${1}:" "Unknown user type '$user_type'" ;;
-    esac
-}
-
-get_user_repos_from_github()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
-        is_empty "$repo_list" && break
-        for repo in $repo_list; do
-            eval "${2} $repo $branch"
-        done
-        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-get_repos_of_user_from_gitlab()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/users/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo' 2> /dev/null)
-        is_empty "$repo_list" && break
-        for repo in $repo_list; do
-            eval "${2} $repo $branch"
-        done
-        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-get_repos_of_org_from_github()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/orgs/${1}/repos${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
-        is_empty "$repo_list" && break
-        for repo in $repo_list; do
-            eval "${2} $repo $branch"
-        done
-        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-get_repos_of_org_from_gitlab()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        repo_list=$(peval "curl -q -s${access_token:+ --header \"PRIVATE-TOKEN: $access_token\"} 'https://gitlab.com/api/v4/groups/${1}/projects${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url_to_repo' 2> /dev/null)
-        is_empty "$repo_list" && break
-        for repo in $repo_list; do
-            eval "${2} $repo $branch"
-        done
-        pagination="?per_page=${GITLAB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-get_repos_of_starred_from_github()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/starred${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
-        is_empty "$repo_list" && break
-        for repo in $repo_list; do
-            eval "${2} $repo $branch"
-        done
-        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-get_repos_of_watched_from_github()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        repo_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/subscriptions${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .ssh_url' 2> /dev/null)
-        is_empty "$repo_list" && break
-        for repo in $repo_list; do
-            eval "${2} $repo $branch"
-        done
-        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-get_repos_from_following_peoples_in_github()
-{
-    mkpd "${dir:-$1}" || continue
-    pagination=; pageno=2
-    while :; do
-        access_token="${access_token:-$default_access_token}"
-        people_list=$(peval "curl -q -s${access_token:+ --header \"Authorization: token $access_token\"} 'https://api.github.com/users/${1}/following${pagination}'" "${SCRIPT_NAME}:" | jq -r '.[] .login' 2> /dev/null)
-        is_empty "$people_list" && break
-        for people in $people_list; do
-            mkpd "$people" || continue
-            get_user_repos_from_github "$people" "${2}"
-        done
-        pagination="?per_page=${GITHUB_MAX_PER_PAGE}&page=${pageno}"; let pageno++
-    done
-    popd &> /dev/null
-}
-
-skeleton()
-{
-    opts="$(getopt -o c:vh --long conf:,verbose,help -n $SCRIPT_NAME -- ${@})"
+    if is_empty "$branch"; then
+        if ! branch=$(LC_ALL=C git remote show origin 2> /dev/null | grep -oP '(?<=HEAD branch: )[^ ]+$'); then
+            log_error "$ws_relpath" "Remote head branch of the '${2}' not found"
+            return 1
+        fi
+        git remote set-head origin "$branch" &> /dev/null
+    else
+        git remote set-head origin -a &> /dev/null
+    fi
+    git clean -fd &> /dev/null
+    git reset --hard HEAD &> /dev/null
+    git checkout "$branch" &> /dev/null
     if [ "${?}" != 0 ]; then
-        perrorl "${SCRIPT_NAME}:" 'Failed to parsing options'
-        "$usage_fn"
+        log_error "$ws_relpath" "Failed to checkout branch to '$branch' in '${2}'"
+        return 1
     fi
-    eval set -- "$opts"
-    config_files=()
-    while true; do
-        case "${1}" in
-        -c | --conf ) config_files+=( "${2}" ); shift 2 ;;
-        -v | --verbose ) is_verbose=true; shift ;;
-        -h | --help ) "$usage_fn" ;;
-        -- ) shift; break ;;
-        * ) die "$ENO_ERROR" "${SCRIPT_NAME}:" 'Internal error' ;;
-        esac
-    done
-    [ "${#config_files[@]}" = 0 ] && "$when_nonconfig_fn" && exit
-    if [ "$is_verbose" = true ]; then
-        spin "$SPIN_INTERVAL" &
-        spin_pid="$!"
+    git reset --hard origin/"$branch" &> /dev/null
+    branches=$(git branch 2> /dev/null | grep -v \* | xargs)
+    if is_set "$branches"; then
+        git branch -D "$branches" &> /dev/null
     fi
-    for c in "${config_files[@]}"; do
-        while read line; do
-            for i in ${line[@]}; do
-                [ "${i:0:1}" = '#' ] && break   # Skip comment
-                eval "$i"
-            done
-            if is_set "$base_dir"; then
-                popd &> /dev/null
-                base_dir="${base_dir:+$(readlink -nf $base_dir)}"
-                mkpd "${base_dir:-$PWD}" || continue
-                unset base_dir
-            fi
-            dir="${dir:+$(readlink -nf $dir)}"
-            if is_set "$repo_url"; then
-                "$git_fn" "$repo_url" "$branch" "$dir"
-            elif is_set "$github_user"; then
-                get_repos_of_user_from_github "$github_user" "$git_fn"
-            elif is_set "$gitlab_user"; then
-                get_repos_of_user_from_gitlab "$gitlab_user" "$git_fn"
-            elif is_set "$github_org"; then
-                get_repos_of_org_from_github "$github_org" "$git_fn"
-            elif is_set "$gitlab_group"; then
-                get_repos_of_org_from_gitlab "$gitlab_group" "$git_fn"
-            elif is_set "$github_starred"; then
-                get_repos_of_starred_from_github "$github_starred" "$git_fn"
-            elif is_set "$github_watched"; then
-                get_repos_of_watched_from_github "$github_watched" "$git_fn"
-            elif is_set "$github_all_following"; then
-                get_repos_from_following_peoples_in_github "$github_all_following" "$git_fn"
-            fi
-            unset repo_url github_user gitlab_user github_org gitlab_group github_starred github_watched github_all_following dir branch access_token
-        done < "$c"
-        unset base_dir default_branch default_access_token
-        popd &> /dev/null
-    done
-    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
+    git branch --set-upstream-to=origin/"$branch" "$branch" &> /dev/null
+    _popd
 }
 
-pull_over_subdirs()
+# 1: repo dir
+# 2: repo url
+clone_repo()
 {
-    repo_base_dirs=()
-    while [ "${#}" -gt 0 ]; do
-        repo_base_dirs+=( "${1}" )
-        shift
-    done
-    [ "${#repo_base_dirs[@]}" = 0 ] && repo_base_dirs+=( "$PWD" )
-    if [ "$is_verbose" = true ]; then
-        spin "$SPIN_INTERVAL" &
-        spin_pid="$!"
+    repo_dir="${1:-$(get_name_from_url ${2})}"
+    repo_url="${2:-$(find_git_url_from_repodir ${1})}"
+    verbose_left_align "$repo_dir" "$repo_url"
+    if ! is_dir "$repo_dir"; then
+        if is_empty "$repo_url"; then
+            verbose_right_most_align 1
+            log_error "$ws_relpath" "'$repo_dir' does not exist and the url is undefined"
+            return
+        fi
+        git_command_autoretry "clone -q${branch:+ -b $branch} $repo_url $repo_dir"; rv="${?}"
+        verbose_right_most_align "$rv"
+        [ "$rv" != 0 ] && log_error "$ws_relpath" "Clone '$repo_url' failed"
+    elif is_set "$is_force"; then
+        errmsg=$(force_clone "$repo_dir" "$repo_url" 2>&1 1> /dev/null); rv="${?}"
+        verbose_right_most_align "$rv"
+        is_set "$errmsg" && echo -e "$errmsg"
+    else
+        verbose_right_most_align 1
+        log_error "$ws_relpath" "'$repo_dir' already exists"
     fi
-    for rbd in "${repo_base_dirs[@]}"; do
-        rbd="$(readlink -nf $rbd)" || continue
-        for rd in "$rbd"/*/; do
-            [ "$is_verbose" = true ] && echo "$rd"
-            ppushd "$rd" &> /dev/null || continue
-            if git rev-parse --is-inside-work-tree &> /dev/null; then
-                if peval_noout "git checkout -q ${branch:-${default_branch:-master}}" "${SCRIPT_NAME}:" "$rd:"; then
-                    peval_noout "git pull -q" "${SCRIPT_NAME}:" "$rd:"
-                fi
-            fi
-            popd &> /dev/null
-        done
-    done
-    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
 }
 
 clone()
 {
-    usage_fn='clone_usage'
-    git_fn='git_clone'
-    when_nonconfig_fn='clone_usage'
-    skeleton "${@}"
+    load_settings
+    verbose_settings
+
+    if ! workspace_base_dir=$(realpath "$workspace_base_dir" 2> /dev/null)  \
+        || ! mkpd "$workspace_base_dir"; then
+        log_error "Failed to create directory '$workspace_base_dir'"
+        exit "$EC_ERROR"
+    fi
+    if [ "$output_mode" = normal ]; then
+        spin "$DEFAULT_SPIN_INTERVAL" &
+        spin_pid="${!}"
+    fi
+    for key in "${!kv_map[@]}"; do
+        log_push_header "$workspace_name.$key"
+        value="${kv_map[$key]}"
+        git config -f "$config_file_loc" --get-all "$workspace_name"."$key" "$value" 2> /dev/null | while read conf_line; do
+            log_push_header "'$conf_line'"
+            clean_config
+            if ! load_config; then
+                log_error "Failed to load '$conf_line'"
+                log_pop_header
+                continue
+            fi
+            case "$key" in
+            repourls )
+                if is_empty "$url"; then
+                    log_error "url is undefined"
+                    log_pop_header
+                    continue
+                fi
+                clone_repo "$dir" "$url" ;;
+
+            repodirs )
+                if is_empty "$dir"; then
+                    log_error "dir is undefined"
+                    log_pop_header
+                    continue
+                fi
+                clone_repo "$dir" "$url" ;;
+
+            followings )
+                if is_set "$api" && [ "$api" != github ]; then
+                    log_error "'$api' is not yet supported"
+                    log_pop_header
+                    continue
+                fi
+                if is_empty "$user"; then
+                    log_error "user is undefined"
+                    log_pop_header
+                    continue
+                fi
+                if ! mkpd "${dir:-$user}"; then
+                    log_error "Failed to create directory '${dir:-$user}'"
+                    log_pop_header
+                    continue
+                fi
+                api_url="${GITHUB_API_LIST_USER_FOLLOWING//<NAME>/${user}}"
+                peoples=$(query_following_peoples_in_github "$api_url")
+                peoples_num=$(wc -w <<< "$peoples")
+                verbose "Get '$peoples_num' following peoples by querying the '$api_url'"
+                for people in $peoples; do
+                    mkpd "$people"
+                    api_url="${GITHUB_API_LIST_USER_REPOS//<NAME>/${people}}"
+                    repos=$(query_repos_of_user_in_github "$api_url")
+                    repos_num=$(wc -w <<< "$repos")
+                    verbose "Get '$repos_num' repositories by querying the '$api_url'"
+                    for repo in $repos; do
+                        clone_repo '' "$repo"
+                    done
+                    _popd
+                done
+                _popd ;;
+
+            users | orgs | starrings | watchings )
+                case "$api" in
+                '' | github )
+                    case "$key" in
+                    users )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITHUB_API_LIST_USER_REPOS//<NAME>/${user}}" ;;
+                    orgs )
+                        if is_empty "$org"; then
+                            log_error "org is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$org}"
+                        api_url="${GITHUB_API_LIST_ORG_REPOS//<NAME>/${org}}" ;;
+                    starrings )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITHUB_API_LIST_USER_STARRED//<NAME>/${user}}" ;;
+                    watchings )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITHUB_API_LIST_USER_SUBSCRIPTIONS//<NAME>/${user}}" ;;
+                    esac
+                    if ! mkpd "$dir"; then
+                        log_error "Failed to create directory '$dir'"
+                        log_pop_header
+                        continue
+                    fi
+                    repos=$(query_repos_of_user_in_github "$api_url")
+                    repos_num=$(wc -w <<< "$repos")
+                    verbose "Get '$repos_num' repositories by querying the '$api_url'"
+                    for repo in $repos; do
+                        clone_repo '' "$repo"
+                    done
+                    _popd ;;
+                gitlab )
+                    case "$key" in
+                    users )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITLAB_API_LIST_USER_PROJECTS//<NAME>/${user}}" ;;
+                    orgs )
+                        if is_empty "$org"; then
+                            log_error "org is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$org}"
+                        api_url="${GITLAB_API_LIST_GROUP_PROJECTS//<NAME>/${org}}" ;;
+                    * )
+                        log_error "'$api' is not yet supported"
+                        log_pop_header
+                        continue ;;
+                    esac
+                    if ! mkpd "$dir"; then
+                        log_error "Failed to create directory '$dir'"
+                        log_pop_header
+                        continue
+                    fi
+                    repos=$(query_repos_of_user_in_gitlab "$api_url")
+                    repos_num=$(wc -w <<< "$repos")
+                    verbose "Get '$repos_num' repositories by querying the '$api_url'"
+                    for repo in $repos; do
+                        clone_repo '' "$repo"
+                    done
+                    _popd ;;
+                * )
+                    log_error "'$api' is not yet supported"
+                    log_pop_header
+                    continue ;;
+                esac ;;
+
+            * )
+                log_error "Impossible error"
+                exit "$EC_ERROR" ;;
+
+            esac
+            clean_config
+            log_pop_header
+        done
+        log_pop_header
+    done
+    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
+    _popd
 }
 
-pull()
+bulk_run_impl()
 {
-    usage_fn='pull_usage'
-    git_fn='git_pull'
-    when_nonconfig_fn='pull_over_subdirs'
-    skeleton "${@}"
+    load_settings
+    verbose_settings
+
+    if ! workspace_base_dir=$(realpath "$workspace_base_dir" 2> /dev/null)  \
+        || ! _pushd "$workspace_base_dir"; then
+        log_error "Failed to change directory '$workspace_base_dir'"
+        exit "$EC_ERROR"
+    fi
+    if [ "$output_mode" = normal ]; then
+        spin "$DEFAULT_SPIN_INTERVAL" &
+        spin_pid="${!}"
+    fi
+    for key in "${!kv_map[@]}"; do
+        log_push_header "$workspace_name.$key"
+        value="${kv_map[$key]}"
+        git config -f "$config_file_loc" --get-all "$workspace_name"."$key" "$value" 2> /dev/null | while read conf_line; do
+            log_push_header "'$conf_line'"
+            clean_config
+            if ! load_config; then
+                log_error "Failed to load '$conf_line'"
+                log_pop_header
+                continue
+            fi
+            case "$key" in
+            repourls )
+                if is_empty "$url"; then
+                    log_error "url is undefined"
+                    log_pop_header
+                    continue
+                fi
+                "$repofn" "$dir" "$url" ;;
+
+            repodirs )
+                if is_empty "$dir"; then
+                    log_error "dir is undefined"
+                    log_pop_header
+                    continue
+                fi
+                "$repofn" "$dir" "$url" ;;
+
+            followings )
+                if is_set "$api" && [ "$api" != github ]; then
+                    log_error "'$api' is not yet supported"
+                    log_pop_header
+                    continue
+                fi
+                if is_empty "$user"; then
+                    log_error "user is undefined"
+                    log_pop_header
+                    continue
+                fi
+                if ! _pushd "${dir:-$user}"; then
+                    log_error "Failed to change directory '${dir:-$user}'"
+                    log_pop_header
+                    continue
+                fi
+                api_url="${GITHUB_API_LIST_USER_FOLLOWING//<NAME>/${user}}"
+                peoples=$(query_following_peoples_in_github "$api_url")
+                peoples_num=$(wc -w <<< "$peoples")
+                verbose "Get '$peoples_num' following peoples by querying the '$api_url'"
+                for people in $peoples; do
+                    if ! _pushd "$people"; then
+                        log_error "Failed to change directory '$people'"
+                        log_pop_header
+                        continue
+                    fi
+                    api_url="${GITHUB_API_LIST_USER_REPOS//<NAME>/${people}}"
+                    repos=$(query_repos_of_user_in_github "$api_url")
+                    repos_num=$(wc -w <<< "$repos")
+                    verbose "Get '$repos_num' repositories by querying the '$api_url'"
+                    for repo in $repos; do
+                        "$repofn" '' "$repo"
+                    done
+                    _popd
+                done
+                _popd ;;
+
+            users | orgs | starrings | watchings )
+                case "$api" in
+                '' | github )
+                    case "$key" in
+                    users )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITHUB_API_LIST_USER_REPOS//<NAME>/${user}}" ;;
+                    orgs )
+                        if is_empty "$org"; then
+                            log_error "org is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$org}"
+                        api_url="${GITHUB_API_LIST_ORG_REPOS//<NAME>/${org}}" ;;
+                    starrings )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITHUB_API_LIST_USER_STARRED//<NAME>/${user}}" ;;
+                    watchings )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITHUB_API_LIST_USER_SUBSCRIPTIONS//<NAME>/${user}}" ;;
+                    esac
+                    if ! _pushd "$dir"; then
+                        log_error "Failed to change directory '$dir'"
+                        log_pop_header
+                        continue
+                    fi
+                    repos=$(query_repos_of_user_in_github "$api_url")
+                    repos_num=$(wc -w <<< "$repos")
+                    verbose "Get '$repos_num' repositories by querying the '$api_url'"
+                    for repo in $repos; do
+                        "$repofn" '' "$repo"
+                    done
+                    _popd ;;
+                gitlab )
+                    case "$key" in
+                    users )
+                        if is_empty "$user"; then
+                            log_error "user is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$user}"
+                        api_url="${GITLAB_API_LIST_USER_PROJECTS//<NAME>/${user}}" ;;
+                    orgs )
+                        if is_empty "$org"; then
+                            log_error "org is undefined"
+                            log_pop_header
+                            continue
+                        fi
+                        dir="${dir:-$org}"
+                        api_url="${GITLAB_API_LIST_GROUP_PROJECTS//<NAME>/${org}}" ;;
+                    * )
+                        log_error "'$api' is not yet supported"
+                        log_pop_header
+                        continue ;;
+                    esac
+                    if ! _pushd "$dir"; then
+                        log_error "Failed to change directory '$dir'"
+                        log_pop_header
+                        continue
+                    fi
+                    repos=$(query_repos_of_user_in_gitlab "$api_url")
+                    repos_num=$(wc -w <<< "$repos")
+                    verbose "Get '$repos_num' repositories by querying the '$api_url'"
+                    for repo in $repos; do
+                        "$repofn" '' "$repo"
+                    done
+                    _popd ;;
+                * )
+                    log_error "'$api' is not yet supported"
+                    log_pop_header
+                    continue ;;
+                esac ;;
+
+            * )
+                log_error "Impossible error"
+                exit "$EC_ERROR" ;;
+
+            esac
+            clean_config
+            log_pop_header
+        done
+        log_pop_header
+    done
+    is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null
+    _popd
 }
 
-clone_or_pull()
+# 1: repo dir
+# 2: repo url
+check_repo()
 {
-    usage_fn='clone_or_pull_usage'
-    git_fn='git_clone_or_pull'
-    when_nonconfig_fn='pull_over_subdirs'
-    skeleton "${@}"
+    repo_dir="${1:-$(get_name_from_url ${2})}"
+    repo_url="${2:-$(find_git_url_from_repodir ${1})}"
+    verbose_left_align "$repo_dir" "$repo_url"
+    if ! _pushd "$repo_dir"; then
+        verbose_right_most_align 1 PASSED FAILED
+        log_error "$ws_relpath" "Failed to change directory '$repo_dir'"
+        return
+    fi
+    if ! is_inside_git_repo; then
+        verbose_right_most_align 1 PASSED FAILED
+        log_error "$ws_relpath" "Directory '$repo_dir' is not a git repository"
+        return
+    fi
+    __log_buffered_mode=true
+    current_branch=$(git branch -q 2> /dev/null | grep \* | cut -d ' ' -f2)
+    if is_set "$branch"; then
+        if [ "$current_branch" != "$branch" ]; then
+            log_checkup_message "$ws_relpath" "The current branch is '$current_branch' and default branch is '$branch'"
+        fi
+    else
+        if ! first_branch=$(LC_ALL=C git remote show origin 2> /dev/null | grep -oP '(?<=HEAD branch: )[^ ]+$'); then
+            log_checkup_message "$ws_relpath" "Remote head branch of the '${1}' not found"
+        fi
+        if [ "$current_branch" != "$first_branch" ]; then
+            log_checkup_message "$ws_relpath" "The current branch is '$current_branch' and remote head branch is '$first_branch'"
+        fi
+    fi
+    tree_status=$(git status -s 2> /dev/null)
+    is_set "$tree_status" && log_checkup_message "$ws_relpath" "The working tree status of Repository '${repo_url}': \n${tree_status}"
+    if [ -n "$__log_buffer" ]; then
+        verbose_right_most_align 1 PASSED FAILED
+        log_flush
+    else
+        verbose_right_most_align 0 PASSED FAILED
+    fi
+    unset __log_buffered_mode
+    _popd
+}
+
+checkup()
+{
+    repofn=check_repo
+    bulk_run_impl
+}
+
+# 1: repo dir
+# 2: repo url
+command_repo()
+{
+    repo_dir="${1:-$(get_name_from_url ${2})}"
+    repo_url="${2:-$(find_git_url_from_repodir ${1})}"
+    verbose_left_align "$repo_dir" "$repo_url"
+    if ! _pushd "$repo_dir"; then
+        verbose_right_most_align 1
+        log_error "$ws_relpath" "Failed to change directory '${repo_dir}'"
+        return
+    fi
+    if ! is_inside_git_repo; then
+        verbose_right_most_align 1
+        log_error "$ws_relpath" "Directory '${repo_dir}' is not a git repository"
+        return
+    fi
+    errmsg=$(eval "$sub_command" 2>&1); rv="${?}"
+    verbose_right_most_align "$rv"
+    is_set "$errmsg" && log_sub_command_message "$rv" "$ws_relpath" "The output of Repository '${repo_url}': \n${errmsg}"
+    _popd
+}
+
+bulk_run()
+{
+    repofn=command_repo
+    bulk_run_impl
+}
+
+list_all()
+{
+    git config -f "$config_file_loc" -l 2> /dev/null
+}
+
+list_values()
+{
+    if is_empty "$workspace_name"; then
+        if ! workspace_name=$(git config -f "$config_file_loc" --get gib.default-workspace-name 2> /dev/null); then
+            log_error "'gib.default-workspace-name' not found"
+            exit "$EC_ERROR"
+        fi
+    fi
+    for key in "${!kv_map[@]}"; do
+        git config -f "$config_file_loc" --get-all "$workspace_name"."$key" "$value" 2> /dev/null
+    done
+}
+
+list_workspace()
+{
+    git config -f "$config_file_loc" --get-regexp "$workspace_name" 2> /dev/null
 }
 
 main()
 {
-    # Interrupted script by SIGHUP SIGINT SIGQUIT SIGTERM
-    trap 'is_set "$spin_pid" && kill -9 "$spin_pid" &> /dev/null && perrorl "Interrupted by signal" >&2; exit' 1 2 3 15
-    cmd="${1}"; shift
-    case "$cmd" in
-    -h | --help ) usage ;;
-    clone ) clone "${@}" ;;
-    pull ) pull "${@}" ;;
-    clone-or-pull ) clone_or_pull "${@}" ;;
-    * ) usage ;;
-    esac
+    set -o pipefail
+    [ "${#}" = 0 ] && usage
+    is_tty 1 && __log_color_stdout=true
+    is_tty 2 && __log_color_stderr=true
+    __log_levels=true
+    log_push_header "$SCRIPT_NAME"
+
+    check_deps
+
+    # Interrupted script by SIGHUP / SIGINT / SIGQUIT / SIGTERM
+    set_trap_handler on_trapped SIGHUP SIGINT SIGQUIT SIGTERM
+
+    opts="$(getopt -o hvqflw:   \
+            --long help,verbose,quiet,force,local,global,system,file:,list,workspace:,repourls::,repodirs::,users::,orgs::,starrings::,watchings::,followings::,clone,checkup \
+            -n $SCRIPT_NAME -- ${@})"
+    if [ "${?}" != 0 ]; then
+        log_error 'Failed to parsing options'
+        usage
+    fi
+    eval set -- "$opts"
+    declare -A kv_map=()
+    output_mode=normal
+    config_file_loc="$LOCAL_CONFIG_FILE_PATH"
+    while true; do
+        case "${1}" in
+        -h | --help )       usage ;;
+        -v | --verbose )    output_mode=verbose; shift ;;
+        -q | --quiet )      output_mode=quiet; __log_off=true; shift ;;
+        --force )           is_force=true; shift ;;
+        --local )           config_file_loc="$LOCAL_CONFIG_FILE_PATH"; shift ;;
+        --global )          config_file_loc="$GLOBAL_CONFIG_FILE_PATH"; shift ;;
+        --system )          config_file_loc="$SYSTEM_CONFIG_FILE_PATH"; shift ;;
+        -f | --file )       config_file_loc="${2}"; shift 2 ;;
+        -l | --list )       action0=list_all; shift ;;
+        -w | --workspace )  action3=list_workspace; workspace_name="${2}"; shift 2 ;;
+        --repourls | --repodirs | --users | --orgs | --starrings | --watchings | --followings )
+            action2=list_values
+            case "${2}" in
+            '' ) kv_map["${1:2}"]= ;;
+            * ) kv_map["${1:2}"]="${2}" ;;
+            esac
+            shift 2 ;;
+        --clone | --checkup )
+            action1="${1:2}"
+            shift ;;
+        -- )                shift; break ;;
+        * )                 log_error 'Internal error'; usage ;;
+        esac
+    done
+    if [ "${#kv_map[@]}" = 0 ]; then
+        kv_map=( [repourls]= [repodirs]= [users]= [orgs]= [starrings]= [watchings]= [followings]= )
+    fi
+    if [ "${#}" \> 0 ]; then
+        action1=bulk_run
+        sub_command="${*}"
+        shift "${#}"
+    elif ! is_tty 0; then
+        action1=bulk_run
+        sub_command=$(cat -)
+    fi
+    if ! is_readable_file "$config_file_loc"; then
+        log_error "Cannot read file $config_file_loc"
+        exit "$EC_ENOENT"
+    fi
+    action="$action0"
+    action="${action:-$action1}"
+    action="${action:-$action2}"
+    action="${action:-$action3}"
+    is_empty "$action" && usage
+    "$action"
 }
 
 main "${@}"
